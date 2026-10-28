@@ -1,64 +1,102 @@
-"""Inventory management logic for FoodBridge.
 
-Handles atomic quantity reservation and release operations so that the
-service layer can stay clean of raw SQL for stock accounting.
-"""
+"""Inventory management logic for FoodBridge."""
+
 from __future__ import annotations
 
 from database.database import transaction
 from utils.demo_backend import ServiceError
 
 
-# ------------------------------------------------------------------ helpers
 MASS_UNITS = ("kg", "L")
 
 
 def to_kg_equivalent(quantity: float, unit: str) -> float:
-    """Convert quantity to kg-equivalent for impact reporting.
-    Only kg and L count; other units return 0."""
+    """Convert supported mass/volume quantities for impact reporting."""
     return quantity if unit in MASS_UNITS else 0.0
 
 
 def reserve_stock(listing_id: int, qty: float, cur) -> None:
-    """Decrement available_quantity by *qty* with a row-level lock.
-    *cur* must be an active cursor inside a transaction.
-    Raises ServiceError on insufficient stock.
-    """
+    """Reserve stock atomically inside an active database transaction."""
+
+    if qty <= 0:
+        raise ValueError("Requested quantity must be positive.")
+
     cur.execute(
         "SELECT available_quantity, status FROM surplus_listings "
         "WHERE id = %s FOR UPDATE",
         (listing_id,),
     )
     row = cur.fetchone()
+
     if not row:
         raise ServiceError("Listing not found.")
-    if row["status"] not in ("available",):
+
+    if row["status"] != "available":
         raise ServiceError(f"This listing is {row['status']}.")
-    if float(row["available_quantity"]) < qty:
-        raise ServiceError(
-            f"Only {float(row['available_quantity']):g} units available."
-        )
+
+    available = float(row["available_quantity"])
+
+    if available < qty:
+        raise ServiceError(f"Only {available:g} units available.")
+
     cur.execute(
-        "UPDATE surplus_listings SET available_quantity = available_quantity - %s "
+        "UPDATE surplus_listings "
+        "SET available_quantity = available_quantity - %s "
         "WHERE id = %s",
         (qty, listing_id),
     )
-    # auto-update status to sold_out if nothing left
+
     cur.execute(
         "UPDATE surplus_listings SET status = 'sold_out' "
-        "WHERE id = %s AND available_quantity <= 0 AND status = 'available'",
+        "WHERE id = %s AND available_quantity <= 0 "
+        "AND status = 'available'",
         (listing_id,),
     )
 
 
 def release_stock(listing_id: int, qty: float, cur) -> None:
-    """Return *qty* back to available_quantity and restore 'available' status.
-    *cur* must be inside an active transaction.
-    """
+    """Release previously reserved stock inside an active transaction."""
+
+    if qty <= 0:
+        raise ValueError("Released quantity must be positive.")
+
     cur.execute(
         "UPDATE surplus_listings "
         "SET available_quantity = available_quantity + %s, "
-        "    status = CASE WHEN status = 'sold_out' THEN 'available' ELSE status END "
+        "status = CASE WHEN status = 'sold_out' "
+        "THEN 'available' ELSE status END "
         "WHERE id = %s",
         (qty, listing_id),
     )
+
+    if cur.rowcount == 0:
+        raise ServiceError("Listing not found.")
+
+
+def check_available_inventory(available_quantity, requested_quantity):
+    """Validate stock quantities without accessing the database."""
+
+    if available_quantity < 0:
+        return False, "Available quantity cannot be negative."
+
+    if requested_quantity <= 0:
+        return False, "Requested quantity must be positive."
+
+    if requested_quantity > available_quantity:
+        return False, "Insufficient stock available."
+
+    return True, "Sufficient stock available."
+
+
+def calculate_remaining_inventory(available_quantity, requested_quantity):
+    """Calculate remaining stock after validating a purchase quantity."""
+
+    is_valid, message = check_available_inventory(
+        available_quantity,
+        requested_quantity,
+    )
+
+    if not is_valid:
+        raise ValueError(message)
+
+    return available_quantity - requested_quantity
